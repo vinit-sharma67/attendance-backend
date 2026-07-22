@@ -1,8 +1,7 @@
 """Google Sheets sync via Apps Script webhook (no Google Cloud needed).
 
-How it works: the Google Sheet contains a small Apps Script web app.
-After attendance is confirmed, the backend POSTs today's records to that
-web app URL, and the script writes them into the sheet.
+v2: subject-wise — each subject gets its own monthly tab in the Sheet
+(e.g. "Maths Jul 2026").
 
 Render env vars:
   SHEETS_WEBHOOK_URL   = the Apps Script /exec URL
@@ -20,7 +19,7 @@ WEBHOOK_URL = os.getenv("SHEETS_WEBHOOK_URL", "")
 WEBHOOK_TOKEN = os.getenv("SHEETS_WEBHOOK_TOKEN", "")
 
 
-def sync_attendance(day: date, records: list[dict]) -> bool:
+def sync_attendance(day: date, subject: str, records: list[dict]) -> bool:
     """records: [{roll_no, name, status, confidence}] sorted by roll no.
     Returns True on success, False if disabled or failed.
     Never raises — attendance saving must not break because of Sheets."""
@@ -30,6 +29,7 @@ def sync_attendance(day: date, records: list[dict]) -> bool:
         payload = json.dumps({
             "token": WEBHOOK_TOKEN,
             "date": day.isoformat(),          # e.g. 2026-07-22
+            "subject": subject or "General",
             "records": [
                 {"roll_no": r["roll_no"], "name": r["name"],
                  "status": r["status"]} for r in records

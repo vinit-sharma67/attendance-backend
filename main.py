@@ -1,9 +1,10 @@
-"""Face Attendance API — FastAPI backend.
+"""Face Attendance API — FastAPI backend (v2: subject/lecture-wise).
 
 Flow:
   1. POST /api/students          -> enroll student (name + roll no + 1-3 photos)
-  2. POST /api/attendance/scan   -> upload 1-2 class photos, get present/absent preview
-  3. POST /api/attendance/confirm-> save the (possibly edited) result to DB
+  2. GET/POST /api/subjects      -> manage lecture subjects (Maths, Physics, ...)
+  3. POST /api/attendance/scan   -> upload class photo(s), get present/absent preview
+  4. POST /api/attendance/confirm-> save the result for a given subject
 Photos are processed in memory and never stored — only embeddings are kept.
 """
 import os
@@ -23,8 +24,8 @@ from sqlalchemy.orm import Session
 import face_engine
 import sheets_sync
 from auth import (create_token, get_current_user, hash_password, verify_password)
-from database import (AttendanceRecord, FaceEmbedding, Student, User, get_db,
-                      init_db, SessionLocal)
+from database import (AttendanceRecord, FaceEmbedding, Student, Subject, User,
+                      get_db, init_db, SessionLocal)
 
 load_dotenv()
 THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.50"))
@@ -140,6 +141,45 @@ def delete_student(student_id: int, db: Session = Depends(get_db),
     return {"ok": True}
 
 
+# ---------- Subjects ----------
+
+class SubjectIn(BaseModel):
+    name: str
+
+
+@app.get("/api/subjects")
+def list_subjects(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    return [{"id": s.id, "name": s.name}
+            for s in db.query(Subject).order_by(Subject.name).all()]
+
+
+@app.post("/api/subjects")
+def add_subject(body: SubjectIn, db: Session = Depends(get_db),
+                _: User = Depends(get_current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Subject name required")
+    if len(name) > 50:
+        raise HTTPException(400, "Subject name too long (max 50)")
+    if db.query(Subject).filter(Subject.name == name).first():
+        raise HTTPException(400, f"Subject '{name}' already exists")
+    s = Subject(name=name)
+    db.add(s)
+    db.commit()
+    return {"id": s.id, "name": s.name}
+
+
+@app.delete("/api/subjects/{subject_id}")
+def delete_subject(subject_id: int, db: Session = Depends(get_db),
+                   _: User = Depends(get_current_user)):
+    s = db.get(Subject, subject_id)
+    if not s:
+        raise HTTPException(404, "Subject not found")
+    db.delete(s)
+    db.commit()
+    return {"ok": True}
+
+
 # ---------- Attendance ----------
 
 @app.post("/api/attendance/scan")
@@ -178,20 +218,25 @@ async def scan(request: Request, photos: list[UploadFile] = File(...),
 class ConfirmIn(BaseModel):
     present_ids: list[int]
     confidences: dict[int, int] = {}   # optional {student_id: percent}
+    subject: str = "General"
 
 
 @app.post("/api/attendance/confirm")
 def confirm(body: ConfirmIn, background: BackgroundTasks,
             db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    """Save today's attendance. Re-running replaces today's records.
+    """Save today's attendance for one subject. Re-running the same subject
+    on the same day replaces that subject's records only.
     Also syncs to Google Sheets in the background (if configured)."""
+    subject = (body.subject or "General").strip() or "General"
     today = date.today()
-    db.query(AttendanceRecord).filter(AttendanceRecord.day == today).delete()
+    db.query(AttendanceRecord).filter(AttendanceRecord.day == today,
+                                      AttendanceRecord.subject == subject).delete()
     saved = 0
     sheet_rows = []
     for s in db.query(Student).order_by(Student.roll_no).all():
         status = "present" if s.id in body.present_ids else "absent"
-        db.add(AttendanceRecord(student_id=s.id, day=today, status=status,
+        db.add(AttendanceRecord(student_id=s.id, day=today, subject=subject,
+                                status=status,
                                 confidence=body.confidences.get(s.id, 0)))
         sheet_rows.append({"roll_no": s.roll_no, "name": s.name,
                            "status": status,
@@ -199,19 +244,22 @@ def confirm(body: ConfirmIn, background: BackgroundTasks,
         saved += 1
     db.commit()
     # Sheets sync runs AFTER the response is sent — app stays fast
-    background.add_task(sheets_sync.sync_attendance, today, sheet_rows)
-    return {"ok": True, "date": str(today), "records": saved}
+    background.add_task(sheets_sync.sync_attendance, today, subject, sheet_rows)
+    return {"ok": True, "date": str(today), "subject": subject, "records": saved}
 
 
 @app.get("/api/attendance/history")
-def history(day: str | None = None, db: Session = Depends(get_db),
-            _: User = Depends(get_current_user)):
+def history(day: str | None = None, subject: str | None = None,
+            db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     q = db.query(AttendanceRecord, Student).join(Student)
     target = date.fromisoformat(day) if day else date.today()
     q = q.filter(AttendanceRecord.day == target)
+    if subject:
+        q = q.filter(AttendanceRecord.subject == subject)
     rows = [{"roll_no": s.roll_no, "name": s.name, "status": r.status,
-             "confidence": r.confidence} for r, s in q.all()]
-    rows.sort(key=lambda x: x["roll_no"])
-    return {"date": str(target), "records": rows,
+             "confidence": r.confidence, "subject": r.subject}
+            for r, s in q.all()]
+    rows.sort(key=lambda x: (x["subject"], x["roll_no"]))
+    return {"date": str(target), "subject": subject, "records": rows,
             "present": sum(1 for r in rows if r["status"] == "present"),
             "absent": sum(1 for r in rows if r["status"] == "absent")}

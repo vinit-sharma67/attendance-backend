@@ -1,18 +1,21 @@
 """Database engine, session and ORM models.
 
 Works with BOTH:
-  - SQLite  (zero setup — default, perfect for daily local use)
-  - PostgreSQL (for cloud deployment later)
+  - SQLite  (zero setup — local dev)
+  - PostgreSQL (Neon — production)
 
 Face embeddings are stored as JSON lists. Matching happens in memory
 (see main.py EMB_CACHE), so no vector extension is needed.
+
+v2: subject/lecture-wise attendance. Existing databases are migrated
+automatically on startup (old records get subject='General').
 """
 import os
 from datetime import date, datetime
 
 from dotenv import load_dotenv
 from sqlalchemy import (JSON, Column, Date, DateTime, ForeignKey, Integer,
-                        String, UniqueConstraint, create_engine)
+                        String, UniqueConstraint, create_engine, text)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 load_dotenv()
@@ -56,19 +59,44 @@ class FaceEmbedding(Base):
     student = relationship("Student", back_populates="embeddings")
 
 
+class Subject(Base):
+    """Lectures/subjects for the class (Maths, Physics, ...)."""
+    __tablename__ = "subjects"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class AttendanceRecord(Base):
     __tablename__ = "attendance_records"
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False)
     day = Column(Date, default=date.today, nullable=False)
+    subject = Column(String(50), nullable=False, default="General")
     status = Column(String(10), nullable=False)  # present / absent
     confidence = Column(Integer, default=0)      # match % for present students
     marked_at = Column(DateTime, default=datetime.utcnow)
-    __table_args__ = (UniqueConstraint("student_id", "day", name="one_record_per_day"),)
+    __table_args__ = (UniqueConstraint("student_id", "day", "subject",
+                                       name="one_record_per_day_subject"),)
+
+
+def _try(sql: str):
+    """Run a migration statement; ignore errors (already applied / not needed)."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(sql))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def init_db():
     Base.metadata.create_all(engine)
+    # Migrations for databases created before subjects existed:
+    _try("ALTER TABLE attendance_records ADD COLUMN subject VARCHAR(50) NOT NULL DEFAULT 'General'")
+    _try("ALTER TABLE attendance_records DROP CONSTRAINT one_record_per_day")
+    _try("CREATE UNIQUE INDEX IF NOT EXISTS one_record_per_day_subject "
+         "ON attendance_records (student_id, day, subject)")
 
 
 def get_db():
