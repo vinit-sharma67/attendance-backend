@@ -1,26 +1,12 @@
-"""InsightFace wrapper — cloud/low-memory friendly.
+"""InsightFace wrapper.
 
-Defaults are tuned for a small free server (Render 512 MB):
-  - FACE_PACK=buffalo_s  (light detection + recognition models, bundled in ./models)
-  - only detection + recognition modules are loaded (no landmarks/genderage)
-  - DET_SIZE=640, MAX_SIDE=1600 keep RAM spikes small
-
-For a bigger server you can set env: FACE_PACK=buffalo_l, DET_SIZE=1280, MAX_SIDE=2560.
-The model is loaded ONCE at startup; embeddings are L2-normalised so cosine
-similarity is a dot product.
+The model is loaded ONCE at startup (slow, ~2-5s) and then every request
+is fast. Embeddings are 512-dim, L2-normalised, so cosine similarity is
+just a dot product.
 """
-import os
-
-import cv2
 import numpy as np
+import cv2
 from insightface.app import FaceAnalysis
-
-PACK = os.getenv("FACE_PACK", "buffalo_s")
-DET_SIZE = int(os.getenv("DET_SIZE", "640"))
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))
-# "." means: look for ./models/<PACK>/*.onnx (bundled in the repo).
-# If not found there, insightface falls back to downloading into this root.
-ROOT = os.getenv("INSIGHTFACE_ROOT", ".")
 
 _app: FaceAnalysis | None = None
 
@@ -29,10 +15,9 @@ def load_model():
     """Call once on server startup."""
     global _app
     if _app is None:
-        _app = FaceAnalysis(name=PACK, root=ROOT,
-                            allowed_modules=["detection", "recognition"],
-                            providers=["CPUExecutionProvider"])
-        _app.prepare(ctx_id=-1, det_size=(DET_SIZE, DET_SIZE))
+        _app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        # det_size 960 = better detection of small faces in a group photo
+        _app.prepare(ctx_id=-1, det_size=(1280, 1280))
     return _app
 
 
@@ -41,9 +26,11 @@ def _decode(image_bytes: bytes) -> np.ndarray:
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image")
+    # Cap very large images to keep detection fast
     h, w = img.shape[:2]
-    if max(h, w) > MAX_SIDE:
-        scale = MAX_SIDE / max(h, w)
+    max_side = 2560
+    if max(h, w) > max_side:
+        scale = max_side / max(h, w)
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
     return img
 
@@ -61,8 +48,31 @@ def extract_faces(image_bytes: bytes) -> list[np.ndarray]:
     return out
 
 
+def extract_single_face_with_thumb(image_bytes: bytes, thumb_size: int = 144):
+    """For enrollment: biggest face -> (embedding, small JPEG thumbnail bytes)."""
+    app = load_model()
+    img = _decode(image_bytes)
+    faces = app.get(img)
+    if not faces:
+        raise ValueError("No face found in photo")
+    faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+               reverse=True)
+    f = faces[0]
+    emb = np.asarray(f.normed_embedding, dtype=np.float32)
+    x1, y1, x2, y2 = [int(v) for v in f.bbox]
+    m = int(0.30 * max(x2 - x1, y2 - y1))          # thodi margin, achha dikhta hai
+    x1 = max(0, x1 - m); y1 = max(0, y1 - m)
+    x2 = min(img.shape[1], x2 + m); y2 = min(img.shape[0], y2 + m)
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        crop = img
+    crop = cv2.resize(crop, (thumb_size, thumb_size))
+    ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return emb, (buf.tobytes() if ok else b"")
+
+
 def extract_single_face(image_bytes: bytes) -> np.ndarray:
-    """For enrollment: expect one clear face, take the biggest."""
+    """For enrollment: expect exactly one clear face, take the biggest."""
     app = load_model()
     img = _decode(image_bytes)
     faces = app.get(img)
@@ -80,9 +90,12 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 def match_faces(photo_embeddings: list[np.ndarray],
                 known: dict[int, list[np.ndarray]],
                 threshold: float) -> dict[int, float]:
-    """Each detected face is compared with every student's embeddings; best
-    score per student wins. Faces below threshold (outsiders) are ignored.
-    Returns {student_id: best_similarity} for matched students."""
+    """Greedy matching: each detected face is compared with every student's
+    embeddings; best score per student wins. Faces below threshold
+    (outsiders) are ignored.
+
+    Returns {student_id: best_similarity} for matched students.
+    """
     matched: dict[int, float] = {}
     for emb in photo_embeddings:
         best_id, best_score = None, threshold
@@ -92,6 +105,7 @@ def match_faces(photo_embeddings: list[np.ndarray],
                 if s > best_score:
                     best_id, best_score = sid, s
         if best_id is not None:
+            # keep the highest score if same student appears in 2 photos
             if best_id not in matched or best_score > matched[best_id]:
                 matched[best_id] = best_score
     return matched

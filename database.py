@@ -15,7 +15,7 @@ from datetime import date, datetime
 
 from dotenv import load_dotenv
 from sqlalchemy import (JSON, Column, Date, DateTime, ForeignKey, Integer,
-                        String, UniqueConstraint, create_engine, text)
+                        String, Text, UniqueConstraint, create_engine, text)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 load_dotenv()
@@ -43,6 +43,7 @@ class Student(Base):
     id = Column(Integer, primary_key=True)
     roll_no = Column(String(20), unique=True, nullable=False)
     name = Column(String(100), nullable=False)
+    photo = Column(Text)          # small base64 JPEG face thumbnail (optional)
     created_at = Column(DateTime, default=datetime.utcnow)
     embeddings = relationship("FaceEmbedding", back_populates="student",
                               cascade="all, delete-orphan")
@@ -97,6 +98,7 @@ def init_db():
     _try("ALTER TABLE attendance_records DROP CONSTRAINT one_record_per_day")
     _try("CREATE UNIQUE INDEX IF NOT EXISTS one_record_per_day_subject "
          "ON attendance_records (student_id, day, subject)")
+    _try("ALTER TABLE students ADD COLUMN photo TEXT")
 
 
 def get_db():

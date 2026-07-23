@@ -54,6 +54,16 @@ def refresh_cache(db: Session):
             np.asarray(e.embedding, dtype=np.float32))
 
 
+def _students_payload(db: Session) -> list[dict]:
+    """Full enrolled list for the Sheet's 'Enrolled Students' tab."""
+    out = []
+    for s in db.query(Student).order_by(Student.roll_no).all():
+        out.append({"roll_no": s.roll_no, "name": s.name,
+                    "photos": len(s.embeddings),
+                    "enrolled_on": s.created_at.strftime("%d %b %Y") if s.created_at else ""})
+    return out
+
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -94,12 +104,13 @@ def list_students(db: Session = Depends(get_db), _: User = Depends(get_current_u
     out = []
     for s in db.query(Student).order_by(Student.roll_no).all():
         out.append({"id": s.id, "roll_no": s.roll_no, "name": s.name,
-                    "photos": len(s.embeddings)})
+                    "photos": len(s.embeddings), "photo": s.photo or ""})
     return out
 
 
 @app.post("/api/students")
-async def add_student(name: str = Form(...), roll_no: str = Form(...),
+async def add_student(background: BackgroundTasks,
+                      name: str = Form(...), roll_no: str = Form(...),
                       photos: list[UploadFile] = File(...),
                       db: Session = Depends(get_db),
                       _: User = Depends(get_current_user)):
@@ -109,28 +120,37 @@ async def add_student(name: str = Form(...), roll_no: str = Form(...),
         raise HTTPException(400, "Upload 1 to 3 photos")
 
     embeddings = []
-    for p in photos:
+    thumb_b64 = None
+    for i, p in enumerate(photos):
         data = await p.read()
         if len(data) > 8 * 1024 * 1024:
             raise HTTPException(400, "Photo too large (max 8 MB)")
         try:
-            embeddings.append(face_engine.extract_single_face(data))
+            if i == 0:
+                emb, thumb = face_engine.extract_single_face_with_thumb(data)
+                embeddings.append(emb)
+                if thumb:
+                    thumb_b64 = base64.b64encode(thumb).decode()
+            else:
+                embeddings.append(face_engine.extract_single_face(data))
         except ValueError:
             raise HTTPException(400, f"No clear face found in '{p.filename}'. Use a front-facing photo.")
 
-    student = Student(name=name.strip(), roll_no=roll_no.strip())
+    student = Student(name=name.strip(), roll_no=roll_no.strip(), photo=thumb_b64)
     db.add(student)
     db.flush()
     for emb in embeddings:
         db.add(FaceEmbedding(student_id=student.id, embedding=emb.tolist()))
     db.commit()
     refresh_cache(db)
+    background.add_task(sheets_sync.sync_students, _students_payload(db))
     return {"id": student.id, "name": student.name, "roll_no": student.roll_no,
             "photos": len(embeddings)}
 
 
 @app.delete("/api/students/{student_id}")
-def delete_student(student_id: int, db: Session = Depends(get_db),
+def delete_student(student_id: int, background: BackgroundTasks,
+                   db: Session = Depends(get_db),
                    _: User = Depends(get_current_user)):
     s = db.get(Student, student_id)
     if not s:
@@ -138,6 +158,7 @@ def delete_student(student_id: int, db: Session = Depends(get_db),
     db.delete(s)
     db.commit()
     refresh_cache(db)
+    background.add_task(sheets_sync.sync_students, _students_payload(db))
     return {"ok": True}
 
 
@@ -284,6 +305,34 @@ def confirm(body: ConfirmIn, background: BackgroundTasks,
     return {"ok": True, "date": str(today), "subject": subject,
             "mode": "replace" if body.replace else "merge",
             "records": len(sheet_rows), "present_total": present_count}
+
+
+@app.post("/api/attendance/resync")
+def resync_sheet(background: BackgroundTasks, subject: str | None = None,
+                 db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    """Rebuild Google Sheet tab(s) from the database — full history.
+    Use when a tab was deleted or looks wrong. Optional ?subject=ML for one tab."""
+    q = db.query(AttendanceRecord, Student).join(Student)
+    if subject:
+        q = q.filter(AttendanceRecord.subject == subject)
+
+    by_subject: dict[str, dict[str, dict]] = {}
+    for r, s in q.all():
+        stus = by_subject.setdefault(r.subject, {})
+        stu = stus.setdefault(s.roll_no, {"name": s.name, "marks": {}})
+        stu["marks"][r.day.isoformat()] = "P" if r.status == "present" else "A"
+
+    if not by_subject:
+        raise HTTPException(404, "No attendance records found to sync")
+
+    for subj, stus in by_subject.items():
+        dates = sorted({d for stu in stus.values() for d in stu["marks"]})
+        rows = [{"roll_no": rn, "name": v["name"],
+                 "marks": [v["marks"].get(d, "") for d in dates]}
+                for rn, v in sorted(stus.items())]
+        background.add_task(sheets_sync.sync_rebuild, subj, dates, rows)
+
+    return {"ok": True, "subjects": sorted(by_subject.keys())}
 
 
 @app.get("/api/attendance/history")
