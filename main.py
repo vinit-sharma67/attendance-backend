@@ -219,33 +219,71 @@ class ConfirmIn(BaseModel):
     present_ids: list[int]
     confidences: dict[int, int] = {}   # optional {student_id: percent}
     subject: str = "General"
+    replace: bool = False              # False = MERGE (default), True = overwrite day
 
 
 @app.post("/api/attendance/confirm")
 def confirm(body: ConfirmIn, background: BackgroundTasks,
             db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    """Save today's attendance for one subject. Re-running the same subject
-    on the same day replaces that subject's records only.
-    Also syncs to Google Sheets in the background (if configured)."""
+    """Save today's attendance for one subject.
+
+    MERGE mode (default): new presents are added/updated, students already
+    marked present earlier today STAY present, everyone still unseen is absent.
+    So multiple saves in one lecture accumulate — nothing is lost.
+
+    REPLACE mode (replace=true): today's records for this subject are wiped
+    and rewritten exactly as sent (use for corrections).
+    Also syncs the FINAL merged state to Google Sheets in the background.
+    """
     subject = (body.subject or "General").strip() or "General"
     today = date.today()
-    db.query(AttendanceRecord).filter(AttendanceRecord.day == today,
-                                      AttendanceRecord.subject == subject).delete()
-    saved = 0
-    sheet_rows = []
-    for s in db.query(Student).order_by(Student.roll_no).all():
-        status = "present" if s.id in body.present_ids else "absent"
-        db.add(AttendanceRecord(student_id=s.id, day=today, subject=subject,
-                                status=status,
-                                confidence=body.confidences.get(s.id, 0)))
-        sheet_rows.append({"roll_no": s.roll_no, "name": s.name,
-                           "status": status,
-                           "confidence": body.confidences.get(s.id, 0)})
-        saved += 1
+
+    existing = {r.student_id: r for r in
+                db.query(AttendanceRecord)
+                  .filter(AttendanceRecord.day == today,
+                          AttendanceRecord.subject == subject).all()}
+
+    if body.replace:
+        for r in existing.values():
+            db.delete(r)
+        db.flush()
+        existing = {}
+
+    for s in db.query(Student).all():
+        conf = body.confidences.get(s.id, 0)
+        if s.id in body.present_ids:
+            rec = existing.get(s.id)
+            if rec:                          # was absent (or present) → present
+                rec.status = "present"
+                if conf > (rec.confidence or 0):
+                    rec.confidence = conf
+            else:
+                db.add(AttendanceRecord(student_id=s.id, day=today,
+                                        subject=subject, status="present",
+                                        confidence=conf))
+        else:
+            if s.id not in existing:         # never seen today → absent
+                db.add(AttendanceRecord(student_id=s.id, day=today,
+                                        subject=subject, status="absent",
+                                        confidence=0))
+            # else: keep existing status (earlier present stays present)
     db.commit()
+
+    # Build FINAL state (after merge) for the Sheet
+    final = (db.query(AttendanceRecord, Student).join(Student)
+             .filter(AttendanceRecord.day == today,
+                     AttendanceRecord.subject == subject).all())
+    sheet_rows = sorted(
+        [{"roll_no": s.roll_no, "name": s.name, "status": r.status,
+          "confidence": r.confidence} for r, s in final],
+        key=lambda x: x["roll_no"])
+    present_count = sum(1 for x in sheet_rows if x["status"] == "present")
+
     # Sheets sync runs AFTER the response is sent — app stays fast
     background.add_task(sheets_sync.sync_attendance, today, subject, sheet_rows)
-    return {"ok": True, "date": str(today), "subject": subject, "records": saved}
+    return {"ok": True, "date": str(today), "subject": subject,
+            "mode": "replace" if body.replace else "merge",
+            "records": len(sheet_rows), "present_total": present_count}
 
 
 @app.get("/api/attendance/history")
