@@ -7,6 +7,7 @@ Flow:
   4. POST /api/attendance/confirm-> save the result for a given subject
 Photos are processed in memory and never stored — only embeddings are kept.
 """
+import base64
 import os
 from datetime import date
 
